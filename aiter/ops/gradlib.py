@@ -80,23 +80,24 @@ def get_hipb_mm_tuned_sols() -> dict:
         cu_num = get_cu_num()
         if not os.path.exists(sol_file):
             return {}
-        df = pd.read_csv(sol_file)
+        df = pd.read_csv(sol_file, keep_default_na=False)
         _hipb_mm_tuned_sols_cache =  df[df["cu_num"] == cu_num].set_index(["M", "N", "K", "in_dtype", "out_dtype", "bias", "scale_A_type", "scale_B_type", "B_preshuffled"])["best_solution_idx"].to_dict()
         # print(_hipb_mm_tuned_sols_cache)
         # return _hipb_mm_tuned_sols_cache
     # return df.set_index(["cu_num", "M", "N", "K", "in_dtype", "out_dtype", "bias", "scale_A_type", "scale_B_type", "B_preshuffled"]).to_dict("index")
+    # print(f"!!!!!!!!!!!!!!!!!!!!!!!!!{_hipb_mm_tuned_sols_cache}")
     return _hipb_mm_tuned_sols_cache
 
 
 def _determine_scale_type(scale: Optional[torch.Tensor], mat_mn: int, scale_mn_dim: int, scale_k_dim: int) -> str:
     if scale is None:
-        return "None"
+        return "no_scale"
     if scale.shape[scale_mn_dim] == mat_mn and scale.shape[scale_k_dim] == 1:
         return "rowwise"
     elif scale.shape[scale_mn_dim] == 1 and scale.shape[scale_k_dim] == 1:
         return "scalar"
     else:
-        return "None"
+        return "no_scale"
 
 
 _unique_shapes_cache = None
@@ -157,8 +158,8 @@ def hipb_mm_tuned(
         
         # global _unique_shapes_cache
         # in_type_str = "fp8" if mat1.dtype == torch.float8_e4m3fnuz else "bf16"
-        # scale_a_str = "rowwise" if scaleA is not None else "None"
-        # scale_b_str = "rowwise" if scaleB is not None else "None"
+        # scale_a_str = "rowwise" if scaleA is not None else "no_scale"
+        # scale_b_str = "rowwise" if scaleB is not None else "no_scale"
         # cond = f"{m},{n},{k},{in_type_str},bf16,{_bias},{scale_a_str},{scale_b_str},{_bpreshuffle}"
         # if cond not in _unique_shapes_cache:
         #     _unique_shapes_cache.add(cond)
@@ -181,7 +182,8 @@ def hipb_mm_tuned(
         # print(f"Using tuned solution {best_solution_idx} for key {key}")
     else:
         best_solution_idx = -1
-        print(f"No tuned solution found for key {key}")
+        # print(f"No tuned solution found for key {key}")
+    # best_solution_idx = tuned_sols.get(key, -1)
 
     return hipb_mm(mat1, mat2, best_solution_idx, bias, out_dtype, scaleA, scaleB, scaleOut, _bpreshuffle)
     

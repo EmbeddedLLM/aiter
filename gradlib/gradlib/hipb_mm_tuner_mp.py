@@ -497,12 +497,12 @@ if __name__ == "__main__":
             # Normalize scale types: "None" string or empty string -> "None"
             if isinstance(scale_a, str):
                 scale_a = scale_a.strip()
-                if scale_a == "" or scale_a.lower() == "none":
-                    scale_a = "None"
+                if scale_a == "" or scale_a.lower() == "none" or scale_a.lower() == "no_scale":
+                    scale_a = "no_scale"
             if isinstance(scale_b, str):
                 scale_b = scale_b.strip()
-                if scale_b == "" or scale_b.lower() == "none":
-                    scale_b = "None"
+                if scale_b == "" or scale_b.lower() == "none" or scale_b.lower() == "no_scale":
+                    scale_b = "no_scale"
 
             b_preshuffled = row.get("B_preshuffled", row.get("bpreshuffle", args.bpreshuffle))
             if isinstance(b_preshuffled, str):

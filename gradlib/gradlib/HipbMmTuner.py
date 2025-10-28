@@ -42,8 +42,8 @@ class HipbMmProblem:
         in_dtype,
         out_dtype,
         bias=False,
-        scale_a_type="None",  # "None", "scalar", "rowwise"
-        scale_b_type="None",  # "None", "scalar", "rowwise"
+        scale_a_type="no_scale",  # "no_scale", "scalar", "rowwise"
+        scale_b_type="no_scale",  # "no_scale", "scalar", "rowwise"
         b_preshuffled=False,
         mp=1,
         err_ratio=0.05,
@@ -139,7 +139,9 @@ class HipbMmProblem:
 
     def _generate_scale(self, scale_type, dim, rowwise_scale, device):
         """Generate scale tensor based on type"""
-        if scale_type == "None" or scale_type is None:
+        if scale_type is None:
+            return None
+        elif scale_type == "no_scale":
             return None
         elif scale_type == "scalar":
             if rowwise_scale is not None:
@@ -488,8 +490,8 @@ class HipbMmTuner:
         self, m, n, k,
         in_dtype, out_dtype,
         bias=False,
-        scale_a_type="None",
-        scale_b_type="None",
+        scale_a_type="no_scale",
+        scale_b_type="no_scale",
         b_preshuffled=False,
     ):
         """Add a single problem to tune"""
@@ -562,10 +564,9 @@ class HipbMmTuner:
             problem_row["B_preshuffled"] == 'True'
         )
 
-        # Normalize scale types - pandas reads "None" as NaN, we need to compare properly
         def normalize_scale(val):
-            if pd.isna(val) or str(val).lower() in ['none', 'nan']:
-                return 'None'
+            if pd.isna(val) or str(val).lower() in ['none', 'nan', 'no_scale']:
+                return 'no_scale'
             return str(val)
 
         problem_scale_a = normalize_scale(problem_row["scale_A_type"])
