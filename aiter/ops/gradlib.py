@@ -55,6 +55,23 @@ def hipb_mm(
 ) -> torch.Tensor: ...
 
 
+@compile_ops("module_hipbsolgemm", gen_fake=gen_hipb_mm_fake_tensor)
+def _hipb_mm_tuned_internal(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    scaleA: Optional[torch.Tensor] = None,
+    scaleB: Optional[torch.Tensor] = None,
+    scaleOut: Optional[torch.Tensor] = None,
+    bpreshuffle: Optional[bool] = None,
+) -> torch.Tensor: ...
+
+
+@compile_ops("module_hipbsolgemm")
+def _hipb_load_solution_cache_internal(csv_path: str, cu_num: int) -> None: ...
+
+
 @compile_ops("module_hipbsolgemm")
 def hipb_findallsols(
     mat1: torch.Tensor,
@@ -67,6 +84,69 @@ def hipb_findallsols(
     bpreshuffle: bool = False,
 ) -> list[int]: ...
 
+
+_hipb_solution_cache_loaded = False
+
+
+@lru_cache(maxsize=1)
+def _ensure_hipb_solution_cache_loaded():
+    """Ensure the C++ solution cache is loaded once"""
+    global _hipb_solution_cache_loaded
+    if not _hipb_solution_cache_loaded:
+        sol_file = AITER_CONFIG_HIPB_MM_TUNED_SOLUTIONS_FILE
+        cu_num = get_cu_num()
+        if os.path.exists(sol_file):
+            _hipb_load_solution_cache_internal(sol_file, cu_num)
+        _hipb_solution_cache_loaded = True
+
+
+def hipb_mm_tuned_cpp(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    scaleA: Optional[torch.Tensor] = None,
+    scaleB: Optional[torch.Tensor] = None,
+    scaleOut: Optional[torch.Tensor] = None,
+    bpreshuffle: Optional[bool] = None,
+) -> torch.Tensor:
+    """
+    Optimized tuned GEMM that automatically selects the best solution.
+    Uses C++ solution cache for minimal overhead.
+    """
+    # Ensure C++ cache is loaded on first call
+    _ensure_hipb_solution_cache_loaded()
+
+    # Optional: capture running shapes if enabled (for tuning)
+    capture_running_shapes, tune_file = _hipb_mm_tuned_capture_running_shapes()
+    if capture_running_shapes:
+        m = mat1.size(0)
+        n = mat2.size(1)
+        k = mat1.size(1)
+        _in_dtype = str(mat1.dtype)
+        _out_dtype = str(out_dtype) if out_dtype is not None else _in_dtype
+        _bias = True if bias is not None else False
+
+        def _determine_scale_type(scale: Optional[torch.Tensor], mat_dim: int, dim1: int, dim2: int) -> str:
+            if scale is None:
+                return "no_scale"
+            if scale.shape[dim1] == mat_dim and scale.shape[dim2] == 1:
+                return "rowwise"
+            elif scale.shape[dim1] == 1 and scale.shape[dim2] == 1:
+                return "scalar"
+            else:
+                return "no_scale"
+
+        scale_a_type = _determine_scale_type(scaleA, m, 0, 1)
+        scale_b_type = _determine_scale_type(scaleB, n, 1, 0)
+        _bpreshuffle = bpreshuffle if bpreshuffle is not None else False
+        _save_tuning_config(tune_file, m, n, k, _in_dtype, _out_dtype, _bias, scale_a_type, scale_b_type, _bpreshuffle)
+
+    # Call the C++ implementation which does fast lookup
+    return _hipb_mm_tuned_internal(mat1, mat2, bias, out_dtype, scaleA, scaleB, scaleOut, bpreshuffle)
+
+
+_unique_shapes_cache = None
 
 _hipb_mm_tuned_sols_cache = None
 
@@ -100,37 +180,7 @@ def _determine_scale_type(scale: Optional[torch.Tensor], mat_mn: int, scale_mn_d
         return "no_scale"
 
 
-_unique_shapes_cache = None
-
-
-@lru_cache(maxsize=1)
-def _hipb_mm_tuned_capture_running_shapes() -> bool:
-    tune_file = os.environ.get("AITER_HIPB_MM_ONLINE_TUNE_FILE", f"{AITER_ROOT_DIR}/aiter/configs/hipb_mm_shapes_to_tune.csv")
-    if not os.path.exists(tune_file):
-        try:
-            with open(tune_file, "w") as f:
-                f.write("M,N,K,in_dtype,out_dtype,bias,scale_A_type,scale_B_type,B_preshuffled\n")
-        except FileExistsError:
-            pass
-        except Exception as e:
-            print(f"Error creating tune file: {e}")
-            return False, None
-    global _unique_shapes_cache
-    if _unique_shapes_cache is None:
-        _unique_shapes_cache = set()
-    return os.environ.get("AITER_HIPB_MM_ONLINE_TUNE", "0") == "1", tune_file
-
-
-def _save_tuning_config(tuned_file: str, m: int, n: int, k: int, in_dtype: str, out_dtype: str, bias: bool, scale_a_type: str, scale_b_type: str, bpreshuffle: bool) -> int:
-    config = f"{m},{n},{k},{in_dtype},{out_dtype},{bias},{scale_a_type},{scale_b_type},{bpreshuffle}"
-    global _unique_shapes_cache
-    if config not in _unique_shapes_cache:
-        _unique_shapes_cache.add(config)
-        with open(tuned_file, "a") as f:
-            f.write(f"{config}\n")
-
-
-def hipb_mm_tuned(
+def hipb_mm_tuned_python(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -179,13 +229,40 @@ def hipb_mm_tuned(
     key = (m, n, k, _in_dtype, _out_dtype, _bias, scale_a_type, scale_b_type, _bpreshuffle)
     if key in tuned_sols:
         best_solution_idx = tuned_sols[key]
-        # print(f"Using tuned solution {best_solution_idx} for key {key}")
+        print(f"Using tuned solution {best_solution_idx} for key {key}")
     else:
         best_solution_idx = -1
         # print(f"No tuned solution found for key {key}")
     # best_solution_idx = tuned_sols.get(key, -1)
 
     return hipb_mm(mat1, mat2, best_solution_idx, bias, out_dtype, scaleA, scaleB, scaleOut, _bpreshuffle)
+
+
+@lru_cache(maxsize=1)
+def _hipb_mm_tuned_capture_running_shapes() -> bool:
+    tune_file = os.environ.get("AITER_HIPB_MM_ONLINE_TUNE_FILE", f"{AITER_ROOT_DIR}/aiter/configs/hipb_mm_shapes_to_tune.csv")
+    if not os.path.exists(tune_file):
+        try:
+            with open(tune_file, "w") as f:
+                f.write("M,N,K,in_dtype,out_dtype,bias,scale_A_type,scale_B_type,B_preshuffled\n")
+        except FileExistsError:
+            pass
+        except Exception as e:
+            print(f"Error creating tune file: {e}")
+            return False, None
+    global _unique_shapes_cache
+    if _unique_shapes_cache is None:
+        _unique_shapes_cache = set()
+    return os.environ.get("AITER_HIPB_MM_ONLINE_TUNE", "0") == "1", tune_file
+
+
+def _save_tuning_config(tuned_file: str, m: int, n: int, k: int, in_dtype: str, out_dtype: str, bias: bool, scale_a_type: str, scale_b_type: str, bpreshuffle: bool) -> int:
+    config = f"{m},{n},{k},{in_dtype},{out_dtype},{bias},{scale_a_type},{scale_b_type},{bpreshuffle}"
+    global _unique_shapes_cache
+    if config not in _unique_shapes_cache:
+        _unique_shapes_cache.add(config)
+        with open(tuned_file, "a") as f:
+            f.write(f"{config}\n")
     
 
 @compile_ops("module_hipbsolgemm")
@@ -219,3 +296,6 @@ def rocb_mm(arg0: torch.Tensor, arg1: torch.Tensor, arg2: int) -> torch.Tensor: 
 
 @compile_ops("module_rocsolgemm")
 def rocb_findallsols(arg0: torch.Tensor, arg1: torch.Tensor) -> list[int]: ...
+
+
+hipb_mm_tuned = hipb_mm_tuned_cpp

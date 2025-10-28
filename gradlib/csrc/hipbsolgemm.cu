@@ -8,6 +8,9 @@
 // __HIP_NO_HALF_CONVERSIONS__ #endif
 
 #include "hipbsolgemm.cuh"
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
 
 // #include <rocblas/rocblas.h>
 
@@ -60,6 +63,47 @@ namespace
   void *d_workspace;
   int request_solutions = 1;
   int returnedAlgoCount = 0;
+
+  // Solution cache for hipb_mm_tuned
+  struct SolutionKey {
+    int64_t m, n, k;
+    hipDataType in_dtype;
+    hipDataType out_dtype;
+    bool has_bias;
+    int8_t scale_a_type; // 0=none, 1=scalar, 2=rowwise
+    int8_t scale_b_type; // 0=none, 1=scalar, 2=rowwise
+    bool b_preshuffled;
+
+    bool operator==(const SolutionKey& other) const {
+      return m == other.m && n == other.n && k == other.k &&
+             in_dtype == other.in_dtype && out_dtype == other.out_dtype &&
+             has_bias == other.has_bias &&
+             scale_a_type == other.scale_a_type &&
+             scale_b_type == other.scale_b_type &&
+             b_preshuffled == other.b_preshuffled;
+    }
+  };
+
+  struct SolutionKeyHash {
+    std::size_t operator()(const SolutionKey& k) const {
+      // Combine hash values using XOR and bit shifting
+      std::size_t h1 = std::hash<int64_t>{}(k.m);
+      std::size_t h2 = std::hash<int64_t>{}(k.n);
+      std::size_t h3 = std::hash<int64_t>{}(k.k);
+      std::size_t h4 = std::hash<int>{}(static_cast<int>(k.in_dtype));
+      std::size_t h5 = std::hash<int>{}(static_cast<int>(k.out_dtype));
+      std::size_t h6 = std::hash<bool>{}(k.has_bias);
+      std::size_t h7 = std::hash<int>{}(k.scale_a_type);
+      std::size_t h8 = std::hash<int>{}(k.scale_b_type);
+      std::size_t h9 = std::hash<bool>{}(k.b_preshuffled);
+
+      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^
+             (h6 << 5) ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8);
+    }
+  };
+
+  std::unordered_map<SolutionKey, int, SolutionKeyHash> solution_cache;
+  bool solution_cache_loaded = false;
 
   struct MatMulConfig
   {
@@ -405,6 +449,171 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Helper function to determine scale type from tensor shape
+static int8_t determine_scale_type(const torch::Tensor* scale, int64_t mat_dim) {
+  if (!scale || scale->numel() == 0) {
+    return 0; // no_scale
+  }
+  if (scale->numel() == 1) {
+    return 1; // scalar
+  }
+  // Check for rowwise: (mat_dim, 1) for scaleA or (1, mat_dim) for scaleB
+  if (scale->dim() == 2) {
+    if ((scale->size(0) == mat_dim && scale->size(1) == 1) ||
+        (scale->size(0) == 1 && scale->size(1) == mat_dim)) {
+      return 2; // rowwise
+    }
+  }
+  return 0; // default to no_scale
+}
+
+// Load solution cache from CSV file
+void load_solution_cache(const std::string& csv_path, int cu_num) {
+  if (solution_cache_loaded) {
+    return; // Already loaded
+  }
+
+  std::ifstream file(csv_path);
+  if (!file.is_open()) {
+    // File doesn't exist, cache remains empty
+    solution_cache_loaded = true;
+    return;
+  }
+
+  std::string line;
+  // Skip header
+  std::getline(file, line);
+
+  while (std::getline(file, line)) {
+    std::istringstream ss(line);
+    std::string token;
+    std::vector<std::string> tokens;
+
+    while (std::getline(ss, token, ',')) {
+      tokens.push_back(token);
+    }
+
+    // Expected columns: M,N,K,in_dtype,out_dtype,bias,scale_A_type,scale_B_type,B_preshuffled,cu_num,best_solution_idx
+    if (tokens.size() < 11) continue;
+
+    int file_cu_num = std::stoi(tokens[9]);
+    if (file_cu_num != cu_num) continue;
+
+    SolutionKey key;
+    key.m = std::stoll(tokens[0]);
+    key.n = std::stoll(tokens[1]);
+    key.k = std::stoll(tokens[2]);
+
+    // Parse dtype strings
+    std::string in_dtype_str = tokens[3];
+    std::string out_dtype_str = tokens[4];
+
+    // Map dtype strings to hipDataType
+    if (in_dtype_str == "torch.float16") {
+      key.in_dtype = HIP_R_16F;
+    } else if (in_dtype_str == "torch.bfloat16") {
+      key.in_dtype = HIP_R_16BF;
+    } else if (in_dtype_str == "torch.float32") {
+      key.in_dtype = HIP_R_32F;
+    } else if (in_dtype_str == "torch.float8_e4m3fnuz") {
+      key.in_dtype = HIP_R_8F_E4M3_FNUZ;
+    } else if (in_dtype_str == "torch.float8_e4m3fn") {
+      key.in_dtype = HIP_R_8F_E4M3;
+    } else {
+      continue; // Unknown dtype
+    }
+
+    if (out_dtype_str == "torch.float16") {
+      key.out_dtype = HIP_R_16F;
+    } else if (out_dtype_str == "torch.bfloat16") {
+      key.out_dtype = HIP_R_16BF;
+    } else if (out_dtype_str == "torch.float32") {
+      key.out_dtype = HIP_R_32F;
+    } else if (out_dtype_str == "torch.float8_e4m3fnuz") {
+      key.out_dtype = HIP_R_8F_E4M3_FNUZ;
+    } else if (out_dtype_str == "torch.float8_e4m3fn") {
+      key.out_dtype = HIP_R_8F_E4M3;
+    } else {
+      continue; // Unknown dtype
+    }
+
+    key.has_bias = (tokens[5] == "True" || tokens[5] == "true");
+
+    // Parse scale types
+    std::string scale_a_str = tokens[6];
+    std::string scale_b_str = tokens[7];
+
+    if (scale_a_str == "scalar") {
+      key.scale_a_type = 1;
+    } else if (scale_a_str == "rowwise") {
+      key.scale_a_type = 2;
+    } else {
+      key.scale_a_type = 0;
+    }
+
+    if (scale_b_str == "scalar") {
+      key.scale_b_type = 1;
+    } else if (scale_b_str == "rowwise") {
+      key.scale_b_type = 2;
+    } else {
+      key.scale_b_type = 0;
+    }
+
+    key.b_preshuffled = (tokens[8] == "True" || tokens[8] == "true");
+
+    int solution_idx = std::stoi(tokens[10]);
+    solution_cache[key] = solution_idx;
+  }
+
+  solution_cache_loaded = true;
+  file.close();
+}
+
+// Query solution index from cache
+int query_solution_index(const torch::Tensor& mat1,
+                         const torch::Tensor& mat2,
+                         std::optional<torch::Tensor> bias,
+                         std::optional<c10::ScalarType> out_dtype,
+                         std::optional<torch::Tensor> scaleA,
+                         std::optional<torch::Tensor> scaleB,
+                         std::optional<bool> bpreshuffle) {
+  SolutionKey key;
+  key.m = mat1.size(0);
+  key.n = mat2.size(1);
+  key.k = mat1.size(1);
+
+  auto in_dtype_scalar = mat1.scalar_type();
+  key.in_dtype = dtype_map.at(in_dtype_scalar);
+
+  auto out_dtype_scalar = out_dtype.has_value() ? out_dtype.value() : in_dtype_scalar;
+  key.out_dtype = dtype_map.at(out_dtype_scalar);
+
+  key.has_bias = bias.has_value();
+
+  // Determine scale types
+  if (scaleA.has_value()) {
+    key.scale_a_type = determine_scale_type(&scaleA.value(), key.m);
+  } else {
+    key.scale_a_type = 0;
+  }
+
+  if (scaleB.has_value()) {
+    key.scale_b_type = determine_scale_type(&scaleB.value(), key.n);
+  } else {
+    key.scale_b_type = 0;
+  }
+
+  key.b_preshuffled = bpreshuffle.value_or(false);
+
+  // Lookup in cache
+  auto it = solution_cache.find(key);
+  if (it != solution_cache.end()) {
+    return it->second;
+  }
+
+  return -1; // Not found, use default
+}
+
 enum class ScalingType {
   TensorWise,      // Both A and B use per-tensor scaling (scalar)
   RowWise,         // Both A and B use rowwise scaling
@@ -467,6 +676,20 @@ static ScalingType get_scaling_type(
       "scale_b.size()=(", scale_b.size(0), ", ", scale_b.size(1), ")");
 
   return ScalingType::Error;
+}
+
+// Tuned version that automatically selects best solution
+torch::Tensor hipb_mm_tuned(const torch::Tensor &mat1,
+                             const torch::Tensor &mat2,
+                             std::optional<torch::Tensor> bias,
+                             std::optional<c10::ScalarType> out_dtype,
+                             std::optional<torch::Tensor> scaleA,
+                             std::optional<torch::Tensor> scaleB,
+                             std::optional<torch::Tensor> scaleOut,
+                             std::optional<bool> bpreshuffle)
+{
+  int solution_index = query_solution_index(mat1, mat2, bias, out_dtype, scaleA, scaleB, bpreshuffle);
+  return hipb_mm(mat1, mat2, solution_index, bias, out_dtype, scaleA, scaleB, scaleOut, bpreshuffle);
 }
 
 torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
@@ -770,6 +993,9 @@ void hipb_create_extension()
 
   // CHECK_HIP_ERROR(hipEventCreate(&start));
   // CHECK_HIP_ERROR(hipEventCreate(&stop));
+
+  // Note: Solution cache loading is deferred to first use via hipb_load_solution_cache
+  // to avoid requiring environment variables/config at extension creation time
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -800,6 +1026,11 @@ std::string getHipblasltKernelName(int solution_index)
   return hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, heuristicResult[0].algo);
 }
 
+// Load solution cache - to be called from Python during initialization
+void hipb_load_solution_cache(const std::string& csv_path, int cu_num) {
+  load_solution_cache(csv_path, cu_num);
+}
+
 #ifndef PREBUILD_KERNELS
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -810,11 +1041,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
         py::arg("scaleB") = std::nullopt, py::arg("scaleOut") = std::nullopt,
         py::arg("bpreshuffle")  = std::nullopt);
+  // Export with internal name for Python wrapper
+  m.def("_hipb_mm_tuned_internal", &hipb_mm_tuned, "hipb_mm_tuned (internal)",
+        py::arg("mat1"), py::arg("mat2"),
+        py::arg("bias") = std::nullopt,
+        py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
+        py::arg("scaleB") = std::nullopt, py::arg("scaleOut") = std::nullopt,
+        py::arg("bpreshuffle")  = std::nullopt);
   m.def("hipb_findallsols", &hipb_findallsols, "hipb_findallsols",
         py::arg("mat1"), py::arg("mat2"), py::arg("bias") = std::nullopt,
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
         py::arg("scaleB") = std::nullopt, py::arg("scaleC") = std::nullopt,
         py::arg("bpreshuffle") = false);
+  // Export with internal name for Python wrapper
+  m.def("_hipb_load_solution_cache_internal", &hipb_load_solution_cache, "Load tuned solutions cache (internal)",
+        py::arg("csv_path"), py::arg("cu_num"));
   m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }
 #endif
