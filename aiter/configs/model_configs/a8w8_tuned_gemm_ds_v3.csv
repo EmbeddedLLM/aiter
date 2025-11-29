@@ -1,3 +1,4 @@
+cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 304,1,192,7168,34,0,12.2119,a8w8_rowwise_256x16x64x512_16x16_1x1_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v3,0.23,113.32,0
 304,1,512,7168,34,0,13.7044,a8w8_rowwise_256x16x64x512_16x16_1x1_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v3,0.54,268.4,0
 304,1,576,7168,34,0,14.3584,a8w8_rowwise_256x16x64x512_16x16_1x1_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v3,0.58,288.13,0
