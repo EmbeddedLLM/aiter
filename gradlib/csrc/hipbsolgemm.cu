@@ -52,18 +52,19 @@ namespace
   // devices? C++ keyword: thread_local <- maybe this can help?
   /*thread_local*/ hipEvent_t event;
 
+  constexpr int num_workspaces = 4;
+  std::map<hipStream_t, int> stream_offset_map;
+  volatile int last_offset = 0;
+
   // hipBLASLt
   hipblasLtHandle_t hipblaslt_handle;
-  hipblasLtMatmulPreference_t preference;
-  size_t workspace_size = 2 * 128 * 1024 * 1024;
+  // hipblasLtMatmulPreference_t preference;
+  hipblasLtMatmulPreference_t preferences[num_workspaces];
+  constexpr size_t workspace_size = 2 * 128 * 1024 * 1024;
   // uint64_t workspace_size = 0;
   void *d_workspace;
-  int request_solutions = 1;
+  constexpr int request_solutions = 1;
   // int returnedAlgoCount = 0;
-
-  constexpr static int num_workspaces = 4;
-  std::map<hipStream_t, void*> d_workspace_map;
-  int last_workspace_index = 0;
 
   struct MatMulConfig
   {
@@ -110,22 +111,31 @@ namespace
   // std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult;
 } // namespace
 
-void* get_workspace_for_stream(hipStream_t &stream)
+inline int get_offset_for_stream(hipStream_t &stream)
 {
-  auto it = d_workspace_map.find(stream);
-  if (it == d_workspace_map.end()) {
-    void* workspace = static_cast<void*>(static_cast<uint8_t*>(d_workspace) + last_workspace_index * workspace_size);
-    d_workspace_map[stream] = workspace;
-    last_workspace_index++;
+  auto it = stream_offset_map.find(stream);
+  if (it == stream_offset_map.end())
+  {
+    int return_offset = last_offset;
+    stream_offset_map[stream] = return_offset;
+    last_offset++;
     // Exhausted all workspaces, reset to the first one
     // TODO: How should the number of workspaces be determined?
-    if (last_workspace_index >= num_workspaces) {
-      last_workspace_index = 0;
+    if (last_offset >= num_workspaces)
+    {
+      last_offset = 0;
     }
-    return workspace;
-  } else {
+    return return_offset;
+  }
+  else
+  {
     return it->second;
   }
+}
+
+inline void* get_workspace_for_stream(hipStream_t &stream) {
+  int offset = get_offset_for_stream(stream);
+  return static_cast<void*>(static_cast<uint8_t*>(d_workspace) + offset * workspace_size);
 }
 
 // find all hipblaslt solutions for given gemm problem
@@ -384,9 +394,9 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   // auto gemm_key { MatMulConfig { op_A, op_B, m, n, k, dtype } };
   // if (heuristic_map.count(gemm_key) <= 0) {
   std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(1);
+  int returnedAlgoCount = 0;
   if (solution_index < 0)
   {
-    int returnedAlgoCount = 0;
     // nvtxRangePushA("hipblasLtMatmulAlgoGetHeuristic");
     // std::cout
     //     << "Warning! HipbSolId Gemm Fallback Path used for solution index <0"
@@ -399,7 +409,8 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
                 << lda << ", " << ldb << ", " << ldc << "), " << std::endl;
     }
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulAlgoGetHeuristic(
-        handle, matmul, matA, matB, matC, matC, preference, request_solutions,
+        handle, matmul, matA, matB, matC, matC,
+        preferences[get_offset_for_stream(stream)], request_solutions,
         heuristicResult.data(), &returnedAlgoCount));
     if ((returnedAlgoCount != request_solutions) && cout_print)
     {
@@ -788,10 +799,12 @@ void hipb_create_extension()
   // hipBLASLt
   CHECK_HIPBLAS_ERROR(hipblasLtCreate(&hipblaslt_handle));
   CHECK_HIP_ERROR(hipMalloc(&d_workspace, workspace_size * num_workspaces));
-  CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&preference));
-  CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceSetAttribute(
-      preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size,
-      sizeof(workspace_size)));
+  for (int i = 0; i < num_workspaces; i++) {
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&preferences[i]));
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceSetAttribute(
+        preferences[i], HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size,
+        sizeof(workspace_size)));
+  }
 
   // CHECK_HIP_ERROR(hipEventCreate(&start));
   // CHECK_HIP_ERROR(hipEventCreate(&stop));
@@ -806,7 +819,9 @@ void hipb_destroy_extension()
 
   // hipBLASLt
   CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
-  CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
+  for (int i = 0; i < num_workspaces; i++) {
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preferences[i]));
+  }
   CHECK_HIP_ERROR(hipFree(d_workspace));
 
   // CHECK_HIP_ERROR(hipEventDestroy(start));
