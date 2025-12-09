@@ -59,7 +59,11 @@ namespace
   // uint64_t workspace_size = 0;
   void *d_workspace;
   int request_solutions = 1;
-  int returnedAlgoCount = 0;
+  // int returnedAlgoCount = 0;
+
+  constexpr static int num_workspaces = 4;
+  std::map<hipStream_t, void*> d_workspace_map;
+  int last_workspace_index = 0;
 
   struct MatMulConfig
   {
@@ -105,6 +109,24 @@ namespace
 
   // std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult;
 } // namespace
+
+void* get_workspace_for_stream(hipStream_t &stream)
+{
+  auto it = d_workspace_map.find(stream);
+  if (it == d_workspace_map.end()) {
+    void* workspace = static_cast<void*>(static_cast<uint8_t*>(d_workspace) + last_workspace_index * workspace_size);
+    d_workspace_map[stream] = workspace;
+    last_workspace_index++;
+    // Exhausted all workspaces, reset to the first one
+    // TODO: How should the number of workspaces be determined?
+    if (last_workspace_index >= num_workspaces) {
+      last_workspace_index = 0;
+    }
+    return workspace;
+  } else {
+    return it->second;
+  }
+}
 
 // find all hipblaslt solutions for given gemm problem
 std::vector<int> hipblasLtMatmul_findallsols_wrapper(
@@ -364,6 +386,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(1);
   if (solution_index < 0)
   {
+    int returnedAlgoCount = 0;
     // nvtxRangePushA("hipblasLtMatmulAlgoGetHeuristic");
     // std::cout
     //     << "Warning! HipbSolId Gemm Fallback Path used for solution index <0"
@@ -392,9 +415,11 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
         hipblaslt_ext::getAlgosFromIndex(handle, algoIndex, heuristicResult));
   }
 
+  void* workspace = get_workspace_for_stream(stream);
+
   hipblasStatus_t status = hipblasLtMatmul(
       handle, matmul, alpha, a, matA, b, matB, beta, c, matC, c, matC,
-      &heuristicResult[0].algo, d_workspace, workspace_size, stream);
+      &heuristicResult[0].algo, workspace, workspace_size, stream);
 
   CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescDestroy(matmul));
   CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matA));
@@ -762,7 +787,7 @@ void hipb_create_extension()
 
   // hipBLASLt
   CHECK_HIPBLAS_ERROR(hipblasLtCreate(&hipblaslt_handle));
-  CHECK_HIP_ERROR(hipMalloc(&d_workspace, workspace_size));
+  CHECK_HIP_ERROR(hipMalloc(&d_workspace, workspace_size * num_workspaces));
   CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&preference));
   CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceSetAttribute(
       preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size,
