@@ -9,6 +9,8 @@
 
 #include "hipbsolgemm.cuh"
 
+#include <shared_mutex>
+
 // #include <rocblas/rocblas.h>
 
 // #ifdef USE_ROCM
@@ -55,6 +57,7 @@ namespace
   constexpr int num_workspaces = 4;
   std::map<hipStream_t, int> stream_offset_map;
   volatile int last_offset = 0;
+  std::shared_mutex stream_offset_map_mutex;
 
   // hipBLASLt
   hipblasLtHandle_t hipblaslt_handle;
@@ -113,24 +116,25 @@ namespace
 
 inline int get_offset_for_stream(hipStream_t &stream)
 {
-  auto it = stream_offset_map.find(stream);
-  if (it == stream_offset_map.end())
   {
-    int return_offset = last_offset;
-    stream_offset_map[stream] = return_offset;
-    last_offset++;
-    // Exhausted all workspaces, reset to the first one
-    // TODO: How should the number of workspaces be determined?
-    if (last_offset >= num_workspaces)
+    // Fast path lookup
+    std::shared_lock<std::shared_mutex> lock(stream_offset_map_mutex);
+    auto it = stream_offset_map.find(stream);
+    if (it != stream_offset_map.end())
     {
-      last_offset = 0;
+      return it->second;
     }
-    return return_offset;
   }
-  else
+  std::unique_lock<std::shared_mutex> lock(stream_offset_map_mutex);
+  auto it = stream_offset_map.find(stream);
+  if (it != stream_offset_map.end())
   {
     return it->second;
   }
+  int return_offset = last_offset;
+  stream_offset_map[stream] = return_offset;
+  last_offset = (last_offset + 1) % num_workspaces;
+  return return_offset;
 }
 
 inline void* get_workspace_for_stream(hipStream_t &stream) {
