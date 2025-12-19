@@ -10,6 +10,9 @@
 #include "hipbsolgemm.cuh"
 
 #include <shared_mutex>
+#include <unordered_map>
+#include <memory>
+#include <mutex>
 
 // #include <rocblas/rocblas.h>
 
@@ -61,19 +64,287 @@ namespace {
 // devices? C++ keyword: thread_local <- maybe this can help?
 /*thread_local*/ hipEvent_t event;
 
-constexpr int num_workspaces = 4;
-std::map<hipStream_t, int> stream_offset_map;
-volatile int last_offset = 0;
-std::shared_mutex stream_offset_map_mutex;
-
-// hipBLASLt
-hipblasLtHandle_t hipblaslt_handle;
-hipblasLtMatmulPreference_t preferences[num_workspaces];
-constexpr size_t workspace_size = 2 * 128 * 1024 * 1024;
-// uint64_t workspace_size = 0;
-void* d_workspace;
+constexpr size_t workspace_size = 2 * 128 * 1024 * 1024;  // 256 MB per workspace
 constexpr int request_solutions = 1;
-// int returnedAlgoCount = 0;
+
+// ============================================================================
+// Handle Pool Implementation (following PyTorch's DeviceThreadHandlePool)
+// ============================================================================
+
+struct HipblasLtHandle {
+    hipblasLtHandle_t handle;
+
+    HipblasLtHandle() : handle(nullptr) {
+        hipblasStatus_t status = hipblasLtCreate(&handle);
+        if (status != HIPBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "Failed to create hipblasLt handle: %s\n",
+                    hipblasStatusToString(status));
+            handle = nullptr;
+        }
+    }
+
+    ~HipblasLtHandle() {
+        if (handle) {
+            hipblasLtDestroy(handle);
+            handle = nullptr;
+        }
+    }
+
+    // Non-copyable, moveable
+    HipblasLtHandle(const HipblasLtHandle&) = delete;
+    HipblasLtHandle& operator=(const HipblasLtHandle&) = delete;
+    HipblasLtHandle(HipblasLtHandle&& other) noexcept : handle(other.handle) {
+        other.handle = nullptr;
+    }
+    HipblasLtHandle& operator=(HipblasLtHandle&& other) noexcept {
+        if (this != &other) {
+            if (handle) {
+                hipblasLtDestroy(handle);
+            }
+            handle = other.handle;
+            other.handle = nullptr;
+        }
+        return *this;
+    }
+};
+
+// Per-device handle pool, following PyTorch's approach
+struct DeviceHandlePool {
+    std::mutex mutex;
+    // device_id -> vector of available handles
+    std::unordered_map<int, std::vector<hipblasLtHandle_t>> available_handles;
+    // device_id -> vector of all created handles (for cleanup)
+    std::unordered_map<int, std::vector<std::unique_ptr<HipblasLtHandle>>> created_handles;
+
+    hipblasLtHandle_t getHandle(int device) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        // Check if we have an available handle for this device
+        auto& available = available_handles[device];
+        if (!available.empty()) {
+            hipblasLtHandle_t handle = available.back();
+            available.pop_back();
+            return handle;
+        }
+
+        // Create a new handle
+        auto new_handle = std::make_unique<HipblasLtHandle>();
+        if (!new_handle->handle) {
+            fprintf(stderr, "Failed to create hipblasLt handle for device %d\n", device);
+            exit(EXIT_FAILURE);
+        }
+
+        hipblasLtHandle_t handle = new_handle->handle;
+        created_handles[device].push_back(std::move(new_handle));
+        return handle;
+    }
+
+    void returnHandle(int device, hipblasLtHandle_t handle) {
+        std::lock_guard<std::mutex> lock(mutex);
+        available_handles[device].push_back(handle);
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        available_handles.clear();
+        created_handles.clear();
+    }
+};
+
+// Global handle pool (singleton)
+DeviceHandlePool& getGlobalHandlePool() {
+    static DeviceHandlePool pool;
+    return pool;
+}
+
+// Thread-local handle cache (to avoid mutex overhead on every call)
+struct ThreadLocalHandles {
+    std::unordered_map<int, hipblasLtHandle_t> device_to_handle;
+
+    ~ThreadLocalHandles() {
+        // Return handles back to the pool when thread terminates
+        auto& pool = getGlobalHandlePool();
+        for (auto& [device, handle] : device_to_handle) {
+            pool.returnHandle(device, handle);
+        }
+    }
+
+    hipblasLtHandle_t getHandle(int device) {
+        auto it = device_to_handle.find(device);
+        if (it != device_to_handle.end()) {
+            return it->second;
+        }
+
+        // Get handle from pool
+        auto handle = getGlobalHandlePool().getHandle(device);
+        device_to_handle[device] = handle;
+        return handle;
+    }
+};
+
+// Get the current thread's handle for the current device
+hipblasLtHandle_t getCurrentHipblasLtHandle() {
+    int device = 0;
+    hipError_t err = hipGetDevice(&device);
+    if (err != hipSuccess) {
+        fprintf(stderr, "Failed to get current device: %s\n", hipGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    thread_local ThreadLocalHandles thread_handles;
+    return thread_handles.getHandle(device);
+}
+
+// ============================================================================
+// Workspace Management (following PyTorch's approach)
+// ============================================================================
+
+struct WorkspaceInfo {
+    void* ptr;
+    size_t size;
+    int device;
+    torch::Tensor tensor;  // Use PyTorch tensor for CUDA graph safety and platform independence
+
+    WorkspaceInfo() : ptr(nullptr), size(0), device(-1) {}
+
+    WorkspaceInfo(size_t sz, int dev) : size(sz), device(dev) {
+        int current_device;
+        CHECK_HIP_ERROR(hipGetDevice(&current_device));
+        if (current_device != device) {
+            CHECK_HIP_ERROR(hipSetDevice(device));
+        }
+
+        // Use PyTorch's allocator for CUDA graph safety
+        // Allocate as uint8 tensor to get raw bytes
+        int64_t num_bytes = static_cast<int64_t>(size);
+        tensor = torch::empty({num_bytes}, torch::dtype(torch::kUInt8).device(torch::kCUDA, device));
+        ptr = tensor.data_ptr();
+
+        if (current_device != device) {
+            CHECK_HIP_ERROR(hipSetDevice(current_device));
+        }
+    }
+
+    ~WorkspaceInfo() {
+        // Tensor destructor will handle freeing
+        ptr = nullptr;
+    }
+
+    // Non-copyable, moveable
+    WorkspaceInfo(const WorkspaceInfo&) = delete;
+    WorkspaceInfo& operator=(const WorkspaceInfo&) = delete;
+    WorkspaceInfo(WorkspaceInfo&& other) noexcept
+        : ptr(other.ptr), size(other.size), device(other.device), tensor(std::move(other.tensor)) {
+        other.ptr = nullptr;
+        other.size = 0;
+        other.device = -1;
+    }
+    WorkspaceInfo& operator=(WorkspaceInfo&& other) noexcept {
+        if (this != &other) {
+            tensor = std::move(other.tensor);
+            ptr = other.ptr;
+            size = other.size;
+            device = other.device;
+            other.ptr = nullptr;
+            other.size = 0;
+            other.device = -1;
+        }
+        return *this;
+    }
+};
+
+struct WorkspacePool {
+    std::shared_mutex mutex;
+    std::map<std::tuple<void*, void*>, std::unique_ptr<WorkspaceInfo>> workspaces;
+
+    void* getWorkspace(hipblasLtHandle_t handle, hipStream_t stream) {
+        auto key = std::make_tuple(static_cast<void*>(handle), static_cast<void*>(stream));
+
+        // Fast path: check if workspace already exists
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex);
+            auto it = workspaces.find(key);
+            if (it != workspaces.end()) {
+                return it->second->ptr;
+            }
+        }
+
+        // Slow path: allocate new workspace
+        int device = 0;
+        CHECK_HIP_ERROR(hipGetDevice(&device));
+
+        auto new_workspace = std::make_unique<WorkspaceInfo>(workspace_size, device);
+        void* workspace_ptr = new_workspace->ptr;
+
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex);
+            // Double-check in case another thread allocated while we were creating
+            auto it = workspaces.find(key);
+            if (it != workspaces.end()) {
+                return it->second->ptr;
+            }
+            workspaces[key] = std::move(new_workspace);
+        }
+
+        return workspace_ptr;
+    }
+
+    void clear() {
+        std::unique_lock<std::shared_mutex> lock(mutex);
+        workspaces.clear();
+    }
+};
+
+// Global workspace pool
+WorkspacePool& getGlobalWorkspacePool() {
+    static WorkspacePool pool;
+    return pool;
+}
+
+// Get workspace for current handle and stream
+void* getWorkspaceForCurrentStream(hipStream_t stream) {
+    hipblasLtHandle_t handle = getCurrentHipblasLtHandle();
+    return getGlobalWorkspacePool().getWorkspace(handle, stream);
+}
+
+// ============================================================================
+// Preference Management (per-thread cache)
+// ============================================================================
+
+struct PreferenceCache {
+    std::unordered_map<hipblasLtHandle_t, hipblasLtMatmulPreference_t> handle_to_preference;
+
+    ~PreferenceCache() {
+        for (auto& [handle, pref] : handle_to_preference) {
+            if (pref) {
+                hipblasLtMatmulPreferenceDestroy(pref);
+            }
+        }
+    }
+
+    hipblasLtMatmulPreference_t getPreference(hipblasLtHandle_t handle) {
+        auto it = handle_to_preference.find(handle);
+        if (it != handle_to_preference.end()) {
+            return it->second;
+        }
+
+        // Create new preference
+        hipblasLtMatmulPreference_t pref = nullptr;
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&pref));
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceSetAttribute(
+            pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &workspace_size, sizeof(workspace_size)));
+
+        handle_to_preference[handle] = pref;
+        return pref;
+    }
+};
+
+hipblasLtMatmulPreference_t getCurrentPreference() {
+    thread_local PreferenceCache pref_cache;
+    hipblasLtHandle_t handle = getCurrentHipblasLtHandle();
+    return pref_cache.getPreference(handle);
+}
 
 struct MatMulConfig
 {
@@ -116,34 +387,6 @@ std::map<at::ScalarType, hipDataType> dtype_map{{at::kHalf, HIP_R_16F},
 
 // std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult;
 } // namespace
-
-inline int get_offset_for_stream(hipStream_t &stream)
-{
-  {
-    // Fast path lookup
-    std::shared_lock<std::shared_mutex> lock(stream_offset_map_mutex);
-    auto it = stream_offset_map.find(stream);
-    if (it != stream_offset_map.end())
-    {
-      return it->second;
-    }
-  }
-  std::unique_lock<std::shared_mutex> lock(stream_offset_map_mutex);
-  auto it = stream_offset_map.find(stream);
-  if (it != stream_offset_map.end())
-  {
-    return it->second;
-  }
-  int return_offset = last_offset;
-  stream_offset_map[stream] = return_offset;
-  last_offset = (last_offset + 1) % num_workspaces;
-  return return_offset;
-}
-
-inline void* get_workspace_for_stream(hipStream_t &stream) {
-  int offset = get_offset_for_stream(stream);
-  return static_cast<void*>(static_cast<uint8_t*>(d_workspace) + offset * workspace_size);
-}
 
 // find all hipblaslt solutions for given gemm problem
 std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
@@ -452,13 +695,14 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
                       << ", (lda, ldb, ldc): (" << lda << ", " << ldb << ", " << ldc << "), "
                       << std::endl;
         }
+        hipblasLtMatmulPreference_t preference = getCurrentPreference();
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulAlgoGetHeuristic(handle,
                                                             matmul,
                                                             matA,
                                                             matB,
                                                             matC,
                                                             matC,
-                                                            preferences[get_offset_for_stream(stream)],
+                                                            preference,
                                                             request_solutions,
                                                             heuristicResult.data(),
                                                             &returnedAlgoCount));
@@ -475,7 +719,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
         CHECK_HIPBLAS_ERROR(hipblaslt_ext::getAlgosFromIndex(handle, algoIndex, heuristicResult));
     }
 
-    void* workspace = get_workspace_for_stream(stream);
+    void* workspace = getWorkspaceForCurrentStream(stream);
 
     hipblasStatus_t status = hipblasLtMatmul(handle,
                                              matmul,
@@ -595,8 +839,9 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
 {
     bool bpreshuffle_flag = bpreshuffle.value_or(false);
 
+    hipblasLtHandle_t handle = getCurrentHipblasLtHandle();
     int version;
-    hipblasLtGetVersion(hipblaslt_handle, &version);
+    hipblasLtGetVersion(handle, &version);
     TORCH_CHECK(!bpreshuffle_flag || version >= 1500,
                 " to use bpreshuffle feature, hipblaslt version should be at least 1500.");
 
@@ -738,7 +983,7 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     auto current_stream{torch::hip::getCurrentHIPStream().stream()};
     void* bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
 
-    CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(handle,
                                                     transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
                                                     transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
                                                     m,
@@ -868,7 +1113,8 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
         }
     }
 
-    return hipblasLtMatmul_findallsols_wrapper(hipblaslt_handle,
+    hipblasLtHandle_t handle = getCurrentHipblasLtHandle();
+    return hipblasLtMatmul_findallsols_wrapper(handle,
                                                transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
                                                transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
                                                m,
@@ -896,51 +1142,32 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
 
 void hipb_create_extension()
 {
-    // CHECK_HIP_ERROR(hipStreamCreate(&weight_stream));
-    // CHECK_HIP_ERROR(hipEventCreateWithFlags(&event, cudaEventDisableTiming));
-
-    // hipBLASLt
-    CHECK_HIPBLAS_ERROR(hipblasLtCreate(&hipblaslt_handle));
-    CHECK_HIP_ERROR(hipMalloc(&d_workspace, workspace_size * num_workspaces));
-    for (int i = 0; i < num_workspaces; i++) {
-        CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&preferences[i]));
-        CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceSetAttribute(
-            preferences[i], HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size,
-            sizeof(workspace_size)));
-    }
-
-    // CHECK_HIP_ERROR(hipEventCreate(&start));
-    // CHECK_HIP_ERROR(hipEventCreate(&stop));
+    // Handles and workspaces are now lazily created per-thread and per-stream
+    // Nothing to do here - the pools will initialize on first use
+    // This function is kept for API compatibility
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void hipb_destroy_extension()
 {
-    // CHECK_HIP_ERROR(hipStreamDestroy(weight_stream));
-    // CHECK_HIP_ERROR(hipEventDestroy(event));
-
-    // hipBLASLt
-    CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
-    for (int i = 0; i < num_workspaces; i++) {
-        CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preferences[i]));
-    }
-    CHECK_HIP_ERROR(hipFree(d_workspace));
-
-    // CHECK_HIP_ERROR(hipEventDestroy(start));
-    // CHECK_HIP_ERROR(hipEventDestroy(stop));
+    // Clear all pools
+    // Thread-local caches will clean up automatically when threads terminate
+    getGlobalHandlePool().clear();
+    getGlobalWorkspacePool().clear();
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 std::string getHipblasltKernelName(int solution_index)
 {
+    hipblasLtHandle_t handle = getCurrentHipblasLtHandle();
     std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(1);
     std::vector<int> algoIndex(1);
     algoIndex[0] = solution_index;
     CHECK_HIPBLAS_ERROR(
-        hipblaslt_ext::getAlgosFromIndex(hipblaslt_handle, algoIndex, heuristicResult));
-    return hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, heuristicResult[0].algo);
+        hipblaslt_ext::getAlgosFromIndex(handle, algoIndex, heuristicResult));
+    return hipblaslt_ext::getKernelNameFromAlgo(handle, heuristicResult[0].algo);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
