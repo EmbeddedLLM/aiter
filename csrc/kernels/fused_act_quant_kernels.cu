@@ -306,8 +306,11 @@ __global__ void fused_act_mul_quant_kernel_cached(
     buffer_x.init_raw();
     buffer_y.init_raw();
 
-    // Round up to VEC_SIZE_I so idx+j accesses are always in-bounds for LDS.
-    const int32_t oob_smem = (d + VEC_SIZE_I - 1) / VEC_SIZE_I * VEC_SIZE_I;
+    // Transposed LDS layout (SoA): store as [VEC_SIZE_I][num_vecs], where num_vecs = ceil(d/VEC_SIZE_I).
+    // This keeps the same LDS footprint as the original linear layout (ceil(d/VEC)*VEC), but makes
+    // each j-plane contiguous across threads to reduce bank conflicts.
+    const int32_t num_vecs = (d + VEC_SIZE_I - 1) / VEC_SIZE_I;
+    const int32_t oob_smem = num_vecs * VEC_SIZE_I;
 
     // Dynamic shared memory layout:
     //   [0 .. oob_smem*sizeof(DTYPE_I))              : cached intermediate (DTYPE_I)
@@ -320,28 +323,36 @@ __global__ void fused_act_mul_quant_kernel_cached(
 
     // Phase 1: Load x/y once, compute r=ACT_FN(x)*y, write r to LDS, and compute absMax.
     float absMax = 1e-10f;
+    const int32_t thread_offset = threadIdx.x * VEC_SIZE_I;
 
-    for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
+    for(int64_t idx = thread_offset; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
+    // for (int64_t idx_base = 0; idx_base < d; idx_base += blockDim.x * VEC_SIZE_I)
+    // {
+    //     int64_t idx = idx_base + threadIdx.x * VEC_SIZE_I;
+        const int32_t vec_idx = static_cast<int32_t>(idx / VEC_SIZE_I);
         vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
         vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
 #pragma unroll
         for(int32_t j = 0; j < VEC_SIZE_I; j++)
         {
-            const int32_t e = static_cast<int32_t>(idx) + j;
-            if(e < d)
+            const int32_t g = static_cast<int32_t>(idx) + j;
+            // SoA transpose: lds_idx = j * num_vecs + vec_idx.
+            const int32_t lds_idx = j * num_vecs + vec_idx;
+
+            if(g < d)
             {
                 float ax = ACT_FN(x[j]);
                 float yv = ck_tile::type_convert<float>(y[j]);
                 float r  = ax * yv;
-                smem_r[e] = ck_tile::type_convert<DTYPE_I>(r);
-                absMax    = max2(absMax, abs(r));
+                smem_r[lds_idx] = ck_tile::type_convert<DTYPE_I>(r);
+                absMax          = max2(absMax, abs(r));
             }
-            else if(e < oob_smem)
+            else
             {
                 // Pad the LDS cache for safe vector reads later.
-                smem_r[e] = ck_tile::type_convert<DTYPE_I>(0.0f);
+                smem_r[lds_idx] = ck_tile::type_convert<DTYPE_I>(0.0f);
             }
         }
     }
@@ -427,8 +438,14 @@ __global__ void fused_act_mul_quant_kernel_cached(
     auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
     buffer_o.init_raw();
 
-    for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
+    for(int64_t idx = thread_offset; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
+    // for (int64_t idx_base = 0; idx_base < d; idx_base += blockDim.x * VEC_SIZE_I)
+    // {
+    //     int64_t idx = idx_base + threadIdx.x * VEC_SIZE_I;
+    //     if (idx >= d) continue;
+        const int32_t vec_idx = static_cast<int32_t>(idx / VEC_SIZE_I);
+
         if constexpr(VEC_SIZE_I == 1)
         {
             float r_fp = ck_tile::type_convert<float>(smem_r[idx]);
@@ -450,7 +467,7 @@ __global__ void fused_act_mul_quant_kernel_cached(
 #pragma unroll
             for(int32_t j = 0; j < VEC_SIZE_I; j++)
             {
-                r_vec[j] = smem_r[static_cast<int32_t>(idx) + j];
+                r_vec[j] = smem_r[j * num_vecs + vec_idx];
             }
 
             static constexpr int32_t vec_size_o =
@@ -461,21 +478,42 @@ __global__ void fused_act_mul_quant_kernel_cached(
 
             int64_t out_idx = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? idx / 2 : idx;
 
-            if constexpr(VEC_SIZE_I <= 16)
+            // Tail-safe store: only vector-store when fully in-bounds; otherwise store scalars.
+            const bool full_vec = (d % VEC_SIZE_I) == 0;
+            if(full_vec || (idx + VEC_SIZE_I <= d))
             {
-                buffer_o.template set(out_idx, 0, true, out_s);
+                if constexpr(VEC_SIZE_I <= 16)
+                {
+                    buffer_o.template set(out_idx, 0, true, out_s);
+                }
+                else
+                {
+                    static constexpr int32_t o_step =
+                        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? 8 : 16;
+                    assert(VEC_SIZE_I % 16 == 0);
+                    using vecT = ck_tile::vec_t<DTYPE_STORE, o_step>;
+                    auto vec    = out_s.template get_as<vecT>();
+                    static constexpr int32_t num_iter = VEC_SIZE_I / 16;
+
+                    for(int32_t j = 0; j < num_iter; j++)
+                    {
+                        buffer_o.template set(out_idx + j * o_step, 0, true, vec[j]);
+                    }
+                }
             }
             else
             {
-                static constexpr int32_t o_step = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? 8 : 16;
-                assert(VEC_SIZE_I % 16 == 0);
-                using vecT = ck_tile::vec_t<DTYPE_STORE, o_step>;
-                auto vec = out_s.template get_as<vecT>();
-                static constexpr int32_t num_iter = VEC_SIZE_I / 16;
-
-                for(int32_t j = 0; j < num_iter; j++)
+                // Scalar tail to avoid writing past d.
+                for(int32_t j = 0; j < VEC_SIZE_I; j++)
                 {
-                    buffer_o.template set(out_idx + j * o_step, 0, true, vec[j]);
+                    const int64_t g = idx + j;
+                    if(g < d)
+                    {
+                        // Note: for fp4x2, scalar tail isn't expected (VEC_SIZE_I >= 2 and packing),
+                        // and typical d is divisible by 2. Keep this conservative for int8/fp8.
+                        out[token_idx * d + g] = ck_tile::type_convert<DTYPE_O>(
+                            ck_tile::type_convert<float>(r_vec[j]) * inverted_scale);
+                    }
                 }
             }
         }
