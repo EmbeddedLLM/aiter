@@ -104,7 +104,6 @@ __global__ void fused_act_mul_quant_kernel_nocache(
 {
     const int64_t token_idx = blockIdx.x;
 
-    // Pointers to the two halves of input
     auto const* ptr_x = (input + token_idx * 2 * d);
     auto const* ptr_y = (input + token_idx * 2 * d + d);
 
@@ -120,12 +119,20 @@ __global__ void fused_act_mul_quant_kernel_nocache(
     // Phase 1: Apply activation and multiply, computing absMax
     float absMax = 1e-10f;
 
-    for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
-    {
-        vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
-        vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
+    int64_t idx = threadIdx.x * VEC_SIZE_I;
+    vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
+    vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        // Compute activation and multiply, track absMax
+    for(; idx < d; idx += blockDim.x * VEC_SIZE_I)
+    {
+        int64_t next_idx = idx + blockDim.x * VEC_SIZE_I;
+        vec_i x_next, y_next;
+        if(next_idx < d)
+        {
+            x_next = buffer_x.template get<vec_i>(next_idx, 0, true);
+            y_next = buffer_y.template get<vec_i>(next_idx, 0, true);
+        }
+
 #pragma unroll
         for(size_t j = 0; j < VEC_SIZE_I; j++)
         {
@@ -137,10 +144,12 @@ __global__ void fused_act_mul_quant_kernel_nocache(
                 absMax = max(absMax, abs(result));
             }
         }
+
+        x = x_next;
+        y = y_next;
     }
 
     // Phase 2: Block reduction to find the maximum absolute value
-    // Use blockDim.x (runtime block size) instead of compile-time BlockSize constant
     if (blockDim.x == 64) {
         absMax = block_reduce<float, hipcub::Max, 64, true>(absMax, hipcub::Max());
     } else if (blockDim.x == 128) {
@@ -176,7 +185,6 @@ __global__ void fused_act_mul_quant_kernel_nocache(
                           ? fp4_scale(absMax) * inverted_DTYPE_MAX
                           : absMax * inverted_DTYPE_MAX;
 
-    // Thread 0 stores the scale
     if(threadIdx.x == 0)
     {
         if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
@@ -209,12 +217,20 @@ __global__ void fused_act_mul_quant_kernel_nocache(
     auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
     buffer_o.init_raw();
 
-    for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
-    {
-        vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
-        vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
+    idx = threadIdx.x * VEC_SIZE_I;
+    x = buffer_x.template get<vec_i>(idx, 0, true);
+    y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        // Recompute activation and multiply, then quantize
+    for(; idx < d; idx += blockDim.x * VEC_SIZE_I)
+    {
+        int64_t next_idx = idx + blockDim.x * VEC_SIZE_I;
+        vec_i x_next, y_next;
+        if(next_idx < d)
+        {
+            x_next = buffer_x.template get<vec_i>(next_idx, 0, true);
+            y_next = buffer_y.template get<vec_i>(next_idx, 0, true);
+        }
+
         if constexpr(VEC_SIZE_I == 1)
         {
             // Special case for VEC_SIZE=1: quantize directly without vec_convert
@@ -250,14 +266,13 @@ __global__ void fused_act_mul_quant_kernel_nocache(
                 result[j] = ck_tile::type_convert<DTYPE_I>(ax * yv);
             }
 
-            // Quantize - use vec_convert which requires VEC_SIZE >= 2
+            // vec_convert which requires VEC_SIZE >= 2
             static constexpr int32_t vec_size_o =
                 std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? VEC_SIZE_I / 2 : VEC_SIZE_I;
 
             auto out_s = ck_tile::vec_convert<DTYPE_O, DTYPE_I, VEC_SIZE_I>(result, inverted_scale)
                              .template get_as<DTYPE_STORE>();
 
-            // Write output
             int64_t out_idx = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? idx / 2 : idx;
 
             if constexpr(VEC_SIZE_I <= 16)
@@ -278,6 +293,9 @@ __global__ void fused_act_mul_quant_kernel_nocache(
                 }
             }
         }
+
+        x = x_next;
+        y = y_next;
     }
 }
 
@@ -292,7 +310,6 @@ __global__ void fused_act_mul_quant_kernel_cached(
 {
     const int64_t token_idx = blockIdx.x;
 
-    // Pointers to the two halves of input
     auto const* ptr_x = (input + token_idx * 2 * d);
     auto const* ptr_y = (input + token_idx * 2 * d + d);
 
@@ -321,10 +338,19 @@ __global__ void fused_act_mul_quant_kernel_cached(
     // Phase 1: Load x/y once, compute r=ACT_FN(x)*y, write r to LDS, and compute absMax.
     float absMax = 1e-10f;
 
-    for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
+    int64_t idx = threadIdx.x * VEC_SIZE_I;
+    vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
+    vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
+
+    for(; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
-        vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
-        vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
+        int64_t next_idx = idx + blockDim.x * VEC_SIZE_I;
+        vec_i x_next, y_next;
+        if(next_idx < d)
+        {
+            x_next = buffer_x.template get<vec_i>(next_idx, 0, true);
+            y_next = buffer_y.template get<vec_i>(next_idx, 0, true);
+        }
 
 #pragma unroll
         for(int32_t j = 0; j < VEC_SIZE_I; j++)
@@ -344,6 +370,9 @@ __global__ void fused_act_mul_quant_kernel_cached(
                 smem_r[e] = ck_tile::type_convert<DTYPE_I>(0.0f);
             }
         }
+
+        x = x_next;
+        y = y_next;
     }
 
     __syncthreads(); // ensure smem_r is fully populated before any thread reuses it
@@ -409,7 +438,7 @@ __global__ void fused_act_mul_quant_kernel_cached(
         }
     }
 
-    // Phase 4: Quantize and write output (reads r from LDS; no 2nd global load; no ACT recompute)
+    // Phase 4: Quantize and write output
     const float inverted_scale =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? row_scale : 1.0f / row_scale;
 
