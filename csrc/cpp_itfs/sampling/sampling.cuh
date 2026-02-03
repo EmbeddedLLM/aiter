@@ -383,7 +383,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
     vec_t<float, VEC_SIZE> probs_vec;
     float aggregate;
     float q    = 1;
-    double low = 0, high = 1.f;
+    float low = 0.f, high = 1.f;
     int sampled_id;
     do
     {
@@ -420,8 +420,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
             // In this case, we use the last valid index as the sampled id
             sampled_id = temp_storage.last_valid_id;
         }
-        double pivot_0 = probs[row_idx * d + sampled_id];
-        double pivot_1 = (pivot_0 + high) / 2;
+        float pivot_0 = probs[row_idx * d + sampled_id];
+        float pivot_1 = (pivot_0 + high) / 2.f;
 
         float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
 #pragma unroll 2
@@ -461,12 +461,13 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
             __syncthreads();
             aggregate_gt_pivot_1 = temp_storage.block_aggregate.value;
         }
-        if(aggregate_gt_pivot_0 < top_p)
+        // Top-p sampling: keep smallest set of highest-probability tokens with cumulative probability >= p
+        if(aggregate_gt_pivot_0 >= top_p)
         {
-            // case 1: pivot_0 accepted
+            // case 1: pivot_0 accepted (enough probability mass accumulated)
             break;
         }
-        if(aggregate_gt_pivot_1 < top_p)
+        if(aggregate_gt_pivot_1 >= top_p)
         {
             // case 2: pivot_0 rejected, pivot_1 accepted
             low  = pivot_0;
@@ -523,7 +524,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
     vec_t<float, VEC_SIZE> probs_vec;
     float aggregate;
     float q    = 1;
-    double low = 0, high = 1.f;
+    float low = 0.f, high = 1.f;
     int sampled_id;
     do
     {
@@ -560,8 +561,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
             // In this case, we use the last valid index as the sampled id
             sampled_id = temp_storage.last_valid_id;
         }
-        double pivot_0 = probs[row_idx * d + sampled_id];
-        double pivot_1 = (pivot_0 + high) / 2;
+        float pivot_0 = probs[row_idx * d + sampled_id];
+        float pivot_1 = (pivot_0 + high) / 2.f;
 
         ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
 #pragma unroll 2
@@ -605,12 +606,13 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
             __syncthreads();
             aggregate_gt_pivot_1 = temp_storage.block_aggregate.pair;
         }
-        if(aggregate_gt_pivot_0.count < k && aggregate_gt_pivot_0.value < p)
+        // Combined top-k + top-p: keep tokens that satisfy both constraints
+        if(aggregate_gt_pivot_0.count >= k && aggregate_gt_pivot_0.value >= p)
         {
-            // case 1: pivot_0 accepted
+            // case 1: pivot_0 accepted (enough elements AND enough probability mass)
             break;
         }
-        if(aggregate_gt_pivot_1.count < k && aggregate_gt_pivot_1.value < p)
+        if(aggregate_gt_pivot_1.count >= k && aggregate_gt_pivot_1.value >= p)
         {
             // case 2: pivot_0 rejected, pivot_1 accepted
             low  = pivot_0;
@@ -674,7 +676,7 @@ __global__ void TopKRenormProbKernel(
     const uint32_t bx = blockIdx.x, tx = threadIdx.x;
     const uint32_t row_idx = bx;
     uint32_t k             = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
-    double pivot = -infinity<float>(), normalizer = 1;
+    float pivot = -infinity<float>(), normalizer = 1.f;
     vec_t<float, VEC_SIZE> probs_vec;
     if(k < d)
     {
@@ -690,20 +692,20 @@ __global__ void TopKRenormProbKernel(
                                     RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
             probs, row_idx, d, temp_storage);
 
-        double low = 0, high = max_val;
+        float low = 0.f, high = max_val;
         float min_gt_low, max_le_high;
         float sum_low = 1;
-        // f(x) = len(nonzero(probs > x)), f(x) is non-increasing
+        // f(x) = len(nonzero(probs >= x)), f(x) is non-increasing
         // min_gt_low = min{p \in probs | p > low}, max_le_high = max{p \in probs | p <= high}
         // loop invariant:
-        // - f(low) >= k, f(high) < k
+        // - f(low) >= k, f(high) < k (using >= comparison to include tied elements)
         // - f(low) > f(min_gt_low) >= f(max_le_high) == f(high)
         // stopping condition: min_gt_low == max_le_high
         // - f(low) >= k, f(min_gt_low) == f(max_le_high) == f(high) < k
         do
         {
-            double pivot_0 = (high + 2 * low) / 3;
-            double pivot_1 = (2 * high + low) / 3;
+            float pivot_0 = (high + 2.f * low) / 3.f;
+            float pivot_1 = (2.f * high + low) / 3.f;
 
             ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
             min_gt_low  = high;
@@ -721,12 +723,13 @@ __global__ void TopKRenormProbKernel(
 #pragma unroll
                 for(uint32_t j = 0; j < VEC_SIZE; ++j)
                 {
+                    // Use >= to include tied elements at k-th position
                     probs_gt_pivot_0_pair[j] = {
-                        (probs_vec[j] > pivot_0) ? probs_vec[j] : 0,
-                        (probs_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+                        (probs_vec[j] >= pivot_0) ? probs_vec[j] : 0,
+                        (probs_vec[j] >= pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
                     probs_gt_pivot_1_pair[j] = {
-                        (probs_vec[j] > pivot_1) ? probs_vec[j] : 0,
-                        (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+                        (probs_vec[j] >= pivot_1) ? probs_vec[j] : 0,
+                        (probs_vec[j] >= pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
 
                     if(probs_vec[j] > low && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)
                     {
@@ -803,7 +806,8 @@ __global__ void TopKRenormProbKernel(
 #pragma unroll
         for(uint32_t j = 0; j < VEC_SIZE; ++j)
         {
-            probs_vec[j] = (probs_vec[j] > pivot) ? probs_vec[j] * normalizer : 0;
+            // Include tied values at k-th position using >= comparison
+            probs_vec[j] = (probs_vec[j] >= pivot) ? probs_vec[j] * normalizer : 0;
         }
         if((i * BLOCK_THREADS + tx) * VEC_SIZE < d)
         {
