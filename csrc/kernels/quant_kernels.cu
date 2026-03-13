@@ -540,9 +540,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
             const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
             uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
-            asm volatile( "s_mov_b32 m0 %0\n\t"
-                "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
-                ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+            asm volatile("s_mov_b32 m0, %0; buffer_load_dword %1, %2, 0 offen lds;" :: "s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc) : "memory");
         }
         opus::s_waitcnt_vmcnt(opus::number<0>{});
         __syncthreads();
