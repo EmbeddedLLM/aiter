@@ -44,7 +44,8 @@ CK_TILE_DEVICE fp32x2_v amd_assembly_pk_mul_f32(fp32x2_v a, fp32x2_t b)
     return c;
 }
 // use scalar math for RDNA4/3 without v_pk_mul_f32
-CK_TILE_DEVICE fp32x2_v amd_scalar_mul_f32(fp32x2_v a, fp32x2_t b){
+CK_TILE_DEVICE fp32x2_v amd_scalar_mul_f32(fp32x2_v a, fp32x2_t b)
+{
     fp32x2_v c;
     c[0] = a[0] * b[0];
     c[1] = a[1] * b[1];
